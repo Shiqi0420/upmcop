@@ -1,0 +1,20 @@
+
+MOEAD_2：启发式＋均匀＋随机选择节点
+MOEAD_A1：权重向量全部用UR  WS     有DVFS
+MOEAD_A：权重向量全部用UR  WS     无DVFS
+
+
+没改模型之前：
+MOEAD_ADW1111  OBL和启发式初始化＋WS UR权重转化
+MOEAD_ADW111：OBL初始化＋WS UR权重转化＋变异交叉概率   这个先不看
+
+
+
+改模型之后：（其实跟模型没太大关系）
+MOEAD_ADW1111 OBL 启发式 权重：OBL和启发式初始化＋WS UR权重转化
+
+MOEAD_ADW1：忽略云计算能耗的时候
+
+MOEAD_APD  ds生成的 自适应权重
+
+MOEAD_ADWCS  加上老师三作的那个链分割

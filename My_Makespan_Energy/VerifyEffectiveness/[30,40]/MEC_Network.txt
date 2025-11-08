@@ -1,0 +1,205 @@
+SeNB:
+Coordinate:
+-39.999999999999986   69.2820323027551
+SMD number:
+4
+SMD:
+Coordinate:
+-72.26762702532665   -22.527548464739112
+Computation capacity:
+0.6402024909559805   0.5402024909559805   0.3902024909559805
+The number of task:
+38
+Channel:
+7
+
+
+
+SMD:
+Coordinate:
+50.37888477782212   45.349102063094236
+Computation capacity:
+0.9356042756042655   0.8356042756042655   0.6856042756042655
+The number of task:
+35
+Channel:
+10
+
+
+
+SMD:
+Coordinate:
+-56.86557731228238   162.67507762834316
+Computation capacity:
+0.6941521188707256   0.5941521188707256   0.4441521188707256
+The number of task:
+34
+Channel:
+6
+
+
+
+SMD:
+Coordinate:
+35.62193082732027   59.66437061587842
+Computation capacity:
+0.6390563102951268   0.5390563102951268   0.3890563102951268
+The number of task:
+32
+Channel:
+8
+
+
+
+---SeNB end---
+
+
+SeNB:
+Coordinate:
+-40.000000000000036   -69.28203230275508
+SMD number:
+3
+SMD:
+Coordinate:
+9.714652108095066   2.9850455979779014
+Computation capacity:
+0.9118722572409463   0.8118722572409464   0.6618722572409463
+The number of task:
+34
+Channel:
+8
+
+
+
+SMD:
+Coordinate:
+-124.69227167648967   -58.31677778260263
+Computation capacity:
+0.9182192391577962   0.8182192391577963   0.6682192391577962
+The number of task:
+36
+Channel:
+9
+
+
+
+SMD:
+Coordinate:
+7.588507681679147   -98.38119948615658
+Computation capacity:
+0.7195706591786013   0.6195706591786013   0.4695706591786013
+The number of task:
+31
+Channel:
+7
+
+
+
+---SeNB end---
+
+
+SeNB:
+Coordinate:
+80.0   -3.9188697572715304e-14
+SMD number:
+8
+SMD:
+Coordinate:
+65.1294029202657   16.478283104823962
+Computation capacity:
+0.6351153521127775   0.5351153521127775   0.3851153521127775
+The number of task:
+31
+Channel:
+8
+
+
+
+SMD:
+Coordinate:
+64.75520773001654   39.94451690184318
+Computation capacity:
+0.5440034983252011   0.44400349832520114   0.2940034983252011
+The number of task:
+34
+Channel:
+10
+
+
+
+SMD:
+Coordinate:
+73.26855860736492   -27.258230656354446
+Computation capacity:
+0.7220751566435997   0.6220751566435997   0.47207515664359967
+The number of task:
+37
+Channel:
+9
+
+
+
+SMD:
+Coordinate:
+107.24319746420974   -73.97074159194082
+Computation capacity:
+0.9873178714778421   0.8873178714778421   0.7373178714778421
+The number of task:
+33
+Channel:
+7
+
+
+
+SMD:
+Coordinate:
+33.74684019717744   17.120252501395644
+Computation capacity:
+0.8923335710763596   0.7923335710763596   0.6423335710763596
+The number of task:
+40
+Channel:
+5
+
+
+
+SMD:
+Coordinate:
+14.438814625141234   -25.87789379483856
+Computation capacity:
+0.5152111228560836   0.41521112285608364   0.2652111228560836
+The number of task:
+32
+Channel:
+1
+
+
+
+SMD:
+Coordinate:
+120.61537790543338   -62.4205652147927
+Computation capacity:
+0.8379872490617528   0.7379872490617528   0.5879872490617528
+The number of task:
+38
+Channel:
+4
+
+
+
+SMD:
+Coordinate:
+149.34232779823293   -36.50281092796458
+Computation capacity:
+0.6702800975723067   0.5702800975723067   0.42028009757230667
+The number of task:
+30
+Channel:
+2
+
+
+
+---SeNB end---
+
+
+---File end---

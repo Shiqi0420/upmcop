@@ -1,0 +1,1228 @@
+import random, copy, math, os,sys
+sys.path.append("./")
+from Tool import myRandom
+import numpy as np
+
+class MOEAD:
+    def __init__(self, popSize, maxGen, T, taskNumberRange):
+        self.popSize = popSize
+        self.maxGen = maxGen
+        self.taskNumberRange = taskNumberRange
+        self.VT = {}  # 权重向量集合
+        self.B = {}  # 权向量的邻居
+        self.T = T  # 邻居数量
+        self.population = []
+        self.Z = []  # 参考点
+        self.objectNumber = 2
+        self.F_rank = []  # 将种群非支配排序分层, 用种群中的个体的下标来表示，一个元素表示第一层,下标从1开始
+
+        self.PF_history = []            #每一代的历史最优Pareto Front
+        self.EP = []                    #保存当前代的历史非支配解
+
+        self.S = None  # 进化矩阵 S
+        self.S_old = None  # 上一代的进化矩阵
+        #---------------------------------------Problem Notation----------------------------------------
+        self.edge_nodes = [
+            {"id": 4, "type": "edge", "compute_capacity": 5, "radius": 100, "power_consumption": 0.8},
+            {"id": 5, "type": "edge", "compute_capacity": 4, "radius": 90, "power_consumption": 0.7},
+            {"id": 6, "type": "edge", "compute_capacity": 3, "radius": 80, "power_consumption": 0.6},
+        ]
+        self.cloud_node = {"id": 7, "type": "cloud", "compute_capacity": 50, "radius": 160, "power_consumption": 0}
+        self.MEC_nodes = self.edge_nodes + [self.cloud_node]
+
+        self.cloud_bandwidth = 1 * pow(10, 9)
+        self.SeNBSet = []
+
+        self.Bandwidth = 20             #Bandwidth
+        self.N = 10             #Number of channel
+        self.w = (self.Bandwidth / self.N) * pow(10, 6)  #The bandwidth of channel
+        self.noisePower = pow(10, -176/10)*pow(10, -3)  #The background noise power (50dBm = 100w)
+        self.kk = pow(10, -11)  #It is a coefficient depending on the chip architecture
+        self.totalSMDNumber = 0  # The total number of SMD in the network system
+        self.codeLength = 0
+
+        self.H = 3  # The number of the core in a SMD.
+        self.readMECNetwork()
+        self.M = self.SeNBSet.__len__()
+        self.calculateInterference()
+        self.calculateDataTransmissionRate()
+        print("The total SMD number: ", self.totalSMDNumber)
+        print("The code length: ", self.codeLength)
+
+
+    def run(self):
+        self.initializeWeightVectorAndNeighbor()
+        self.initializePopulation()
+        self.initializeReferencePoint()
+        self.fast_non_dominated_sort(self.population)
+        self.initializeEP(self.F_rank[1])
+        self.previous_g_values = None
+
+        self.S = [[float('inf') for _ in range(self.popSize)] for _ in range(self.popSize)]
+        self.S_old = [[float('inf') for _ in range(self.popSize)] for _ in range(self.popSize)]
+
+        t = 1
+        while (t <= self.maxGen):
+            print('Generation--', t)
+
+            for i in range(self.popSize):
+                y_ = self.reproduction(i)
+                self.updateReferencePoint(y_)
+                self.updateNeighborSolutions(i, y_)
+                self.update_EP_FromElement(self.EP, y_)
+
+            # 计算当前代每个子问题的TCH值
+            current_g_values = []
+            for i in range(self.popSize):
+                g_val = self.getTchebycheffValue(i, self.population[i])
+                current_g_values.append(g_val)
+
+            # 如果不是第一代，计算相似度
+            if t > 1:
+                count_similar = 0
+                for i in range(self.popSize):
+                    if abs(current_g_values[i] - self.previous_g_values[i]) <= 1e-3:
+                        count_similar += 1
+                similarity = count_similar / self.popSize
+            else:
+                similarity = 0.0  # 第一代没有上一代，相似度为0
+
+            # 保存当前代的TCH值列表，供下一代使用
+            self.previous_g_values = current_g_values
+
+            divisor = int(self.maxGen * 0.05)
+            if divisor > 0 and (t >= int(self.maxGen * 0.2)) and (t <= int(self.maxGen * 0.9)) and (t % divisor == 0):
+
+                if similarity >= 0.99:
+                    # 调用 adapt_weights，不再需要传递 Sold 和 Snew
+                    self.adapt_weights(t, self.maxGen)
+
+            t += 1
+
+
+        for ep in self.EP:
+            ep.temp_fitness = ep.fitness[0]
+        test_fast = sorted(self.EP, key=lambda Individual: Individual.temp_fitness)
+        EP_list = [copy.deepcopy(ind.fitness) for ind in test_fast]
+        return EP_list  # 返回最终的非支配解集
+
+    """
+        **********************************************run**********************************************
+    """
+
+    def adapt_weights(self, gen, Tmax, period_percent=0.05, start=0.2, end=0.9,
+                      similarity_threshold=0.99, pw=0.2, k=None):
+        """Check timing and similarity and adapt weight vectors using EP (external population) when conditions meet.
+           Minimal-impact strategy: replace inactive weight vectors (with empty subspaces) by generating new weights from EP.
+        """
+        N = len(self.VT)
+        if k is None:
+            k = self.objectNumber  # subspace size default
+
+        # check generation percentage and period
+        frac = gen / float(Tmax)
+        if frac < start or frac > end:
+            return  # no change
+
+        # check period: only check every period_percent fraction of Tmax
+        period_gen = max(1, int(Tmax * period_percent))
+        if (gen % period_gen) != 0:
+            return
+
+        # 注意：相似度检查现在在 run 方法中进行，这里不再需要检查相似度
+        # 因为只有相似度满足条件时才会调用这个函数
+
+        # if EP is empty, cannot adapt
+        if not hasattr(self, 'EP') or len(self.EP) == 0:
+            return
+
+        # Build subspaces U for each weight: assign each EP solution to closest weight by perpendicular distance
+        Nw = len(self.VT)
+        U = {j: [] for j in range(Nw)}
+        A = []  # temporary archive for overflow
+
+        # compute perpendicular distances
+        # build list of EP fitness vectors
+        EP_f = [p.fitness for p in self.EP if hasattr(p, 'fitness')]
+        if len(EP_f) == 0:
+            return
+
+        for idx, f in enumerate(EP_f):
+            # f' = f - z
+            fp = [f_i - z_i for f_i, z_i in zip(f, self.Z)]
+            # find closest weight
+            dists = []
+            for j, lam in self.VT.items():
+                # perpendicular distance formula
+                # project fp onto lam: lam * (fp . lam)/||lam||^2 then take norm of difference
+                num = sum([a * b for a, b in zip(fp, lam)])
+                lam_norm2 = sum([a * a for a in lam])
+                proj = [(num / lam_norm2) * a for a in lam] if lam_norm2 > 0 else [0] * len(lam)
+                diff = [a - b for a, b in zip(fp, proj)]
+                dperp = math.sqrt(sum([d * d for d in diff]))
+                dists.append((j, dperp))
+            dists.sort(key=lambda x: x[1])
+            chosen = dists[0][0]
+            if len(U[chosen]) < k:
+                U[chosen].append(idx)
+            else:
+                A.append(idx)
+
+        # collect indices of empty subspaces
+        empty_idxs = [j for j in U.keys() if len(U[j]) == 0]
+        # try to give second chance: if A non-empty, assign some from A randomly to empty
+        random.shuffle(A)
+        while empty_idxs and A:
+            j = empty_idxs.pop(0)
+            idx = A.pop(0)
+            U[j].append(idx)
+
+        # For remaining empties, replace their weight with a new weight generated from the most sparse EP solution
+        if empty_idxs:
+            # compute sparsity of EP solutions relative to current population (simple approach: avg distance to nearest neighbors in population)
+            # build population fitness list
+            pop_f = [ind.fitness for ind in self.population if hasattr(ind, 'fitness')]
+            if len(pop_f) == 0:
+                return
+            sparsities = []
+            for idx, f in enumerate(EP_f):
+                # distances to pop
+                dists = sorted([math.dist(f, pf) for pf in pop_f])
+                # use 2nd nearest neighbor as in paper; if not available use nearest
+                if len(dists) >= 2:
+                    val = dists[1]
+                else:
+                    val = dists[0] if dists else 1.0
+                sparsities.append((idx, val))
+            sparsities.sort(key=lambda x: x[1], reverse=True)
+            # replace each empty weight by generating weight from top sparse solutions
+            for j in empty_idxs:
+                if sparsities:
+                    idx_sp = sparsities.pop(0)[0]
+                else:
+                    idx_sp = 0
+                fsp = EP_f[idx_sp]
+                new_w = self.generate_weight_from_solution(fsp, self.Z)
+                # replace the weight vector in-place to keep population size identical
+                self.VT[j] = new_w
+
+        # recompute neighbors B after weight changes
+        # same neighbor building logic as initializeWeightVectorAndNeighbor
+        all_keys = list(self.VT.keys())
+        for i in all_keys:
+            distance = []
+            for j in all_keys:
+                if i != j:
+                    tup = (j, self.getDistance(self.VT[i], self.VT[j]))
+                    distance.append(tup)
+            distance = sorted(distance, key=lambda x: x[1])
+            neighbor = []
+            T = min(self.T, len(distance))
+            for r in range(T):
+                neighbor.append(distance[r][0])
+            self.B[i] = neighbor
+
+        # reset EP as in paper
+        try:
+            self.EP = []
+        except Exception:
+            pass
+
+
+    def generate_weight_from_solution(self, f, z):
+        """Generate a weight vector from a solution fitness f and ideal point z using Eq.(13).
+           f and z are lists of objective values. Returns normalized weight list."""
+        eps = 1e-6
+        m = len(f)
+        vals = []
+        for i in range(m):
+            denom = f[i] - z[i]
+            if denom <= 0:
+                denom = eps
+            vals.append(1.0 / denom)
+        s = sum(vals)
+        if s == 0:
+            s = eps * m
+        return [v / s for v in vals]
+
+
+
+    # def calculateAPD(self, ind, weight_vector):
+    #     """
+    #     计算个体的角度惩罚距离(Angle-Penalized Distance)
+    #     """
+    #     # 归一化适应度值
+    #     normalized_fitness = [(ind.fitness[i] - self.Z[i]) for i in range(self.objectNumber)]
+    #     # 避免除零
+    #     norm = sum([abs(f) for f in normalized_fitness]) + 1e-9
+    #     if norm == 0:
+    #         return float('inf')
+    #     # 计算角度
+    #     cos_angle = sum([normalized_fitness[i] * weight_vector[i] for i in range(self.objectNumber)]) / (
+    #             (sum([f * f for f in normalized_fitness]) ** 0.5) * (sum([w * w for w in weight_vector]) ** 0.5) + 1e-9)
+    #     cos_angle = max(-1, min(1, cos_angle))  # 限制在[-1,1]范围内
+    #     angle = math.acos(cos_angle)
+    #     # 计算距离
+    #     distance = sum([f * f for f in normalized_fitness]) ** 0.5
+    #     # APD = distance * (1 + penalty * angle)
+    #     penalty = 2  # 惩罚因子
+    #     apd = distance * (1 + penalty * angle)
+    #     return apd
+
+    # def updateWeightVectors(self):
+    #     updated_indices = []
+    #     # 对于EP中的每个个体，应用Algorithm 4的逻辑
+    #     for ep in self.EP:
+    #         # 计算EP个体的APD值（使用自适应权重）
+    #         adaptive_weight = self.computeAdaptiveWeight(ep)
+    #         ep_apd = self.calculateAPD(ep, adaptive_weight)
+    #
+    #         # 在当前种群中找到m个最近的解作为NS
+    #         distances = []
+    #         for i, ind in enumerate(self.population):
+    #             dist = self.getDistance(ep.fitness, ind.fitness)
+    #             distances.append((i, dist, ind))
+    #
+    #         # 按距离排序，选择最近的m个解
+    #         distances.sort(key=lambda x: x[1])
+    #         NS_indices = []
+    #         NS_solutions = []
+    #         for j in range(min(self.objectNumber, len(distances))):
+    #             NS_indices.append(distances[j][0])
+    #             NS_solutions.append(distances[j][2])
+    #         # 检查EP个体是否有最低的APD值
+    #         ns_apd_values = [self.calculateAPD(sol, self.computeAdaptiveWeight(sol)) for sol in NS_solutions]
+    #         if ep_apd < min(ns_apd_values):
+    #             # 找到NS中APD值最高的解
+    #             worst_idx_in_ns = 0
+    #             worst_apd = ns_apd_values[0]
+    #             for j in range(1, len(ns_apd_values)):
+    #                 if ns_apd_values[j] > worst_apd:
+    #                     worst_apd = ns_apd_values[j]
+    #                     worst_idx_in_ns = j
+    #             # 获取在种群中的实际索引
+    #             worst_population_idx = NS_indices[worst_idx_in_ns]
+    #             # 移除APD值最高的个体及其对应的权重向量
+    #             if worst_population_idx in self.VT:
+    #                 del self.VT[worst_population_idx]
+    #             # 生成新的权重向量
+    #             new_weight = self.computeAdaptiveWeight(ep)
+    #             # 添加新的子问题到权重集合和种群
+    #             self.VT[worst_population_idx] = new_weight
+    #             self.population[worst_population_idx] = copy.deepcopy(ep)
+    #             # 记录更新的索引
+    #             updated_indices.append(worst_population_idx)
+    #     # 3. 更新邻域关系（如果有权重向量被更新）
+    #     if updated_indices:
+    #         self.updateNeighborhoods(updated_indices)
+    #     return self.population, self.VT, self.B
+
+    # def updateNeighborhoods(self, updated_indices):
+    #     # 对于每个更新过的权重向量，重新计算其邻域
+    #     for idx in updated_indices:
+    #         if idx in self.VT:
+    #             # 计算该权重向量与其他所有权重向量的距离
+    #             distances = []
+    #             for j in self.VT.keys():
+    #                 if j != idx:
+    #                     dist = self.getDistance(self.VT[idx], self.VT[j])
+    #                     distances.append((j, dist))
+    #             # 按距离排序并选择最近的T个作为邻居
+    #             distances = sorted(distances, key=lambda x: x[1])
+    #             neighbor_indices = [j for j, _ in distances[:self.T]]
+    #             # 更新邻域关系
+    #             self.B[idx] = neighbor_indices
+    #     # 同时，也需要更新其他权重向量的邻域（因为邻域关系是相互的）
+    #     self.recomputeAllNeighborhoods()
+    #
+    # def recomputeAllNeighborhoods(self):
+    #     """
+    #     重新计算所有权重向量的邻域关系
+    #     """
+    #     for i in self.VT.keys():
+    #         distances = []
+    #         for j in self.VT.keys():
+    #             if i != j:
+    #                 dist = self.getDistance(self.VT[i], self.VT[j])
+    #                 distances.append((j, dist))
+    #
+    #         distances = sorted(distances, key=lambda x: x[1])
+    #         neighbor_indices = [j for j, _ in distances[:self.T]]
+    #         self.B[i] = neighbor_indices
+    #
+    # def computeAdaptiveWeight(self, ind):
+    #     # 计算新的权重向量 (Eq.4)
+    #     f = ind.fitness
+    #     z = self.Z
+    #     weights = [(f[i] - z[i]) / (sum([f[j] - z[j] for j in range(len(f))]) + 1e-9) for i in range(len(f))]
+    #     return weights
+
+
+
+    def initializeEP(self, F_rank):
+        for ind in F_rank:
+            pareto = Pareto()
+            pareto.fitness = copy.deepcopy(ind.fitness)
+            self.EP.append(pareto)
+
+    def initializeWeightVectorAndNeighbor(self):
+        self.VT = self.Mixed_WeightVectorInitialization()
+
+        for i in self.VT.keys():
+            distance = []
+            for j in self.VT.keys():
+                if (i != j):
+                    tup = (j, self.getDistance(self.VT[i], self.VT[j]))
+                    distance.append(tup)
+            distance = sorted(distance, key=lambda x: x[1])
+            neighbor = []
+            for j in range(self.T):
+                neighbor.append(distance[j][0])
+            self.B[i] = neighbor
+
+    def Mixed_WeightVectorInitialization(self):
+        lambda_selected = []
+        # 一半均匀线性划分
+        H = (self.popSize // 2) - 1
+        for i in range(0, H + 1):
+            w1 = i / H
+            w2 = 1.0 - w1
+            # w1 = (i / H) ** 2
+            # w2 = 1.0 - w1
+            lambda_selected.append([w1, w2])
+        # 一半UR+WS
+        candidate = self.generateCandidateWeightVectors()
+        while len(lambda_selected) < self.popSize:
+            max_distance = -1
+            selected_vector = None
+            for candidate_vec in candidate:
+                if candidate_vec not in lambda_selected:
+                    min_distance = float('inf')
+                    for selected in lambda_selected:
+                        dist = self.getDistance(candidate_vec, selected)
+                        if dist < min_distance:
+                            min_distance = dist
+                    if min_distance > max_distance:
+                        max_distance = min_distance
+                        selected_vector = candidate_vec
+            if selected_vector is not None:
+                lambda_selected.append(selected_vector)
+
+        lambda_transformed = {}
+        for i, weight_vector in enumerate(lambda_selected):
+            transformed_vector = self.WS_transformation(weight_vector)
+            lambda_transformed[i] = transformed_vector
+
+        return lambda_transformed
+
+    def WS_transformation(self, weight_vector):
+        m = len(weight_vector)
+        sum_reciprocal = 0.0
+        eps = 1e-6
+        for i in range(m):
+            sum_reciprocal += 1.0 / (weight_vector[i] + eps)
+
+        transformed_vector = []
+        for i in range(m):
+            transformed_component = (1.0 / (weight_vector[i] + eps)) / sum_reciprocal
+            transformed_vector.append(transformed_component)
+        return transformed_vector
+
+    def generateCandidateWeightVectors(self):
+        lambda_minus = []
+        candidate_size = self.popSize * 5
+        for _ in range(candidate_size):
+            w1 = random.random()
+            w2 = 1.0 - w1
+            weight_vector = [w1, w2]
+            lambda_minus.append(weight_vector)
+        return lambda_minus
+
+    def tent_map_sequence(self, length, x0=None, mu=2.0):
+        """Generate a tent chaotic map sequence in (0,1).
+        Using x_{n+1} = mu * min(x_n, 1-x_n). Returns list of length 'length'.
+        """
+        seq = []
+        if x0 is None:
+            x = random.random() * 0.999999 + 1e-6
+        else:
+            x = float(x0) % 1.0
+            if x == 0.0:
+                x = 1e-6
+        for _ in range(length):
+            x = mu * min(x, 1.0 - x)
+            # small perturbation if stuck
+            if x <= 0.0 or x >= 1.0:
+                x = (x + 1e-6) % 1.0
+            seq.append(x)
+        return seq
+
+    def initializePopulation(self):
+        # 随机
+        for i in range(int(self.popSize / 2)):
+            ind = Individual()
+            for senb in self.SeNBSet:
+                for smd in senb.SMDSet:
+                    temp_smd = copy.deepcopy(smd)
+                    connected_node = self.getConnectedEdgeNode(temp_smd.coordinate, senb.coordinate)
+
+                    for j in range(temp_smd.workflow.taskNumber):
+                        # 根据节点类型确定位置范围
+                        pos_range = [1, 2, 3, connected_node["id"], 7]
+                        # 使用改进的帐篷映射（tent chaotic map）生成序列并映射到离散位置
+                        seq = self.tent_map_sequence(temp_smd.workflow.taskNumber, x0=(i + 1) * 0.618033)
+                        u = seq[j]
+                        idx_pos = int(u * len(pos_range))
+                        if idx_pos >= len(pos_range):
+                            idx_pos = len(pos_range) - 1
+                        temp_smd.workflow.position.append(pos_range[idx_pos])
+
+                    temp_smd.workflow.sequence = self.initializeWorkflowSequence(temp_smd.workflow)
+                    ind.chromosome.append(temp_smd)
+            self.calculateFitness(ind)
+            self.population.append(ind)
+        # 启发式
+        for i in range(int(self.popSize / 2)):
+            ind = Individual()
+            for senb in self.SeNBSet:
+                for smd in senb.SMDSet:
+                    temp_smd = copy.deepcopy(smd)
+                    connected_node = self.getConnectedEdgeNode(temp_smd.coordinate, senb.coordinate)
+
+                    for j in range(temp_smd.workflow.taskNumber):
+                        task = temp_smd.workflow.taskSet[j]
+
+                        # 计算本地执行时间（三个核心的平均值）
+                        T_local = (task.c_i_j_k / temp_smd.coreCC[1] +
+                                   task.c_i_j_k / temp_smd.coreCC[2] +
+                                   task.c_i_j_k / temp_smd.coreCC[3]) / 3
+
+                        # 计算不同MEC节点的执行时间
+                        T_mec_options = []
+                        for node in self.MEC_nodes:
+                            if node["type"] == "edge" and node["id"] in [4, 5, 6]:
+                                # 边缘节点执行：无线传输 + 边缘计算 + 无线返回
+                                T_edge = (task.d_i_j_k + task.o_i_j_k) / temp_smd.R_i_j + task.c_i_j_k / node[
+                                    "compute_capacity"]
+                                T_mec_options.append((node["id"], T_edge))
+                            elif node["type"] == "cloud" and node["id"] == 7:
+                                # 云中心执行：无线传输 + 有线传输 + 云计算
+                                T_cloud = (
+                                                      task.d_i_j_k + task.o_i_j_k) / temp_smd.R_i_j + task.d_i_j_k / self.cloud_bandwidth + task.c_i_j_k / \
+                                          node["compute_capacity"]
+                                T_mec_options.append((node["id"], T_cloud))
+
+                        # 选择最优的MEC节点
+                        best_mec_id = min(T_mec_options, key=lambda x: x[1])[0] if T_mec_options else None
+
+                        if best_mec_id and T_mec_options[best_mec_id - 4][1] <= T_local:
+                            temp_smd.workflow.position.append(best_mec_id)
+                        else:
+                            temp_smd.workflow.position.append(random.randint(1, 3))
+
+                    temp_smd.workflow.sequence = self.initializeWorkflowSequence(temp_smd.workflow)
+                    ind.chromosome.append(temp_smd)
+            self.calculateFitness(ind)
+            self.population.append(ind)
+
+    def getConnectedEdgeNode(self, smd_coordinate, senb_coordinate):
+        distance_to_senb = self.getDistance(smd_coordinate, senb_coordinate)
+        available_nodes = []
+        for node in self.MEC_nodes:
+            if distance_to_senb <= node["radius"]:
+                available_nodes.append(node)
+        return random.choice(available_nodes)
+
+
+
+    def initializeReferencePoint(self):
+        fitness_1 = [] #存储所有个体的第一个适应度值
+        fitness_2 = [] #存储所有个体的第二个适应度值
+        for ind in self.population:
+            fitness_1.append(ind.fitness[0])
+            fitness_2.append(ind.fitness[1])
+        self.Z.append(min(fitness_1))
+        self.Z.append(min(fitness_2))
+
+
+    def reproduction(self, i):
+        k = random.choice(self.B[i])
+        l = random.choice(self.B[i])
+        ind_k = Individual()
+        ind_l = Individual()
+        for gene in self.population[k].chromosome:
+            smd_k = copy.deepcopy(gene)
+            self.reInitialize_WorkflowTaskSet_Schedule(smd_k)
+            ind_k.chromosome.append(smd_k)
+
+        for gene in self.population[l].chromosome:
+            smd_l = SMD()
+            smd_l.workflow.position = copy.copy(gene.workflow.position)
+            smd_l.workflow.sequence = copy.copy(gene.workflow.sequence)
+            ind_l.chromosome.append(smd_l)
+
+        self.crossoverOperator(ind_k, ind_l)
+        self.mutantOperator(ind_k)
+        self.calculateFitness(ind_k)
+        return ind_k
+
+
+    def crossoverOperator(self, ind_k, ind_l):
+        for i in range(self.totalSMDNumber):
+            gene_1 = ind_k.chromosome[i]
+            gene_2 = ind_l.chromosome[i]
+            cpt = random.randint(0, len(gene_1.workflow.position) - 1)
+            cPart_1 = []  # 保存第一个个体的执行顺序的从开始到交叉点的片段
+            cPart_2 = []  # 保存第二个个体的执行顺序的从开始到交叉点的片段
+            # 执行位置交叉
+            for j in range(0, cpt):
+                gene_1.workflow.position[j], gene_2.workflow.position[j] = gene_2.workflow.position[j], gene_1.workflow.position[j]
+                cPart_1.append(gene_1.workflow.sequence[j])
+                cPart_2.append(gene_2.workflow.sequence[j])
+            # 执行顺序交叉
+            for j in range(len(cPart_1)):
+                gene_2.workflow.sequence.remove(cPart_1[j])  # 在个体二中移除第一个个体的交叉片段
+                gene_1.workflow.sequence.remove(cPart_2[j])  # 在个体一中移除第二个个体的交叉片段
+            gene_1.workflow.sequence = cPart_2 + gene_1.workflow.sequence
+            gene_2.workflow.sequence = cPart_1 + gene_2.workflow.sequence
+
+
+    def mutantOperator(self, ind):
+        for gene in ind.chromosome:
+            rnd_SMD = myRandom.get_0to1_RandomNumber()
+            if (rnd_SMD < 1.0 / self.totalSMDNumber):  # 针对每一个基因（SMD）判断是否变异
+                for i in range(gene.workflow.position.__len__()):
+                    rnd_bit = myRandom.get_0to1_RandomNumber()
+                    if (rnd_bit < 1.0 / (gene.workflow.taskNumber)):
+                        pos = gene.workflow.position[i]
+                        rand = [1, 2, 3, 4, 5, 6, 7]
+                        rand.remove(pos)
+                        gene.workflow.position[i] = random.choice(rand)
+
+                r = random.randint(1, gene.workflow.sequence.__len__() - 2)  # 随机选择一个变异位置
+                formerSetPoint = []
+                rearSetPoint = []
+                for i in range(0, gene.workflow.sequence.__len__() - 1):  # 从前往后直到所有的前驱任务都被包含在formerSetPoint中
+                    formerSetPoint.append(gene.workflow.sequence[i])
+                    if set(gene.workflow.taskSet[r].preTaskSet).issubset(set(formerSetPoint)):
+                        break
+                for j in range(gene.workflow.sequence.__len__() - 1, -1, -1):  # 从后往前直到所有的后继任务都被包含在rearSetPoint中
+                    rearSetPoint.append(gene.workflow.sequence[j])
+                    if set(gene.workflow.taskSet[r].sucTaskSet).issubset(set(rearSetPoint)):
+                        break
+                rnd_insert_pt = random.randint(i + 1, j - 1)  # 从i+1到j-1之间随机选一个整数
+                gene.workflow.sequence.remove(r)  # 移除变异任务
+                gene.workflow.sequence.insert(rnd_insert_pt, r)  # 在随机生成的插入点前插入r
+
+
+    def updateReferencePoint(self, y_):
+        for j in range(self.objectNumber):
+            if(self.Z[j] > y_.fitness[j]):
+                self.Z[j] = y_.fitness[j]
+
+
+    def updateNeighborSolutions(self, i, y_):
+        for j in self.B[i]:
+            y_g_te = self.getTchebycheffValue(j, y_)
+            neig_g_te = self.getTchebycheffValue(j, self.population[j])
+            if(y_g_te <= neig_g_te):
+                self.population[j] = y_
+
+
+
+    def update_EP_FromElement(self, EP, ind):
+        if EP == []:
+            pareto = Pareto()
+            pareto.fitness = copy.deepcopy(ind.fitness)
+            pareto.chromosome = copy.deepcopy(ind.chromosome)  # 保存完整信息
+            EP.append(pareto)
+        else:
+            i = 0
+            while (i < len(EP)):
+                if (self.isDominated(ind.fitness, EP[i].fitness) == True):
+                    EP.remove(EP[i])
+                    i -= 1
+                i += 1
+            for ep in EP:
+                if (self.isDominated(ep.fitness, ind.fitness) == True):
+                    return None
+            if (self.isExist(ind, EP) == False):
+                pareto = Pareto()
+                pareto.fitness = copy.deepcopy(ind.fitness)
+                pareto.chromosome = copy.deepcopy(ind.chromosome)
+                EP.append(pareto)
+
+
+    def getTchebycheffValue(self, index, ind):  #index是fitness个体的索引，用来获取权重向量
+        g_te = []
+        for i in range(self.objectNumber):
+            temp = self.VT[index][i] * abs(ind.fitness[i] - self.Z[i])
+            g_te.append(temp)
+        return max(g_te)
+
+
+    def isExist(self, ind, EP):   #判断个体ind的适应度是否与EP中某个个体的适应度相对，若相等，则返回True
+        for ep in EP:
+            if ind.fitness == ep.fitness: # 判断两个列表对应元素的值是否相等
+                return True
+        return False
+
+
+    def isEP_Dominated_ind(self, ind, EP):   #判断EP中的某个个体是否支配ind，若支配，则返回True
+        for ep in EP:
+            if self.isDominated(ep.fitness, ind.fitness):
+                return True
+        return False
+
+
+    def fast_non_dominated_sort(self, population):
+        for p in population:
+            p.S_p = []
+            p.rank = None
+            p.n = 0
+
+        self.F_rank = []
+        F1 = []  # 第一个非支配解集前端
+        self.F_rank.append(None)
+        for p in population:
+            for q in population:
+                if self.isDominated(p.fitness, q.fitness):
+                    p.S_p.append(q)
+                elif self.isDominated(q.fitness, p.fitness):
+                    p.n += 1
+            if (p.n == 0):
+                p.rank = 1
+                F1.append(p)
+        self.F_rank.append(F1)
+
+        i = 1
+        while (self.F_rank[i] != []):
+            Q = []
+            for p in self.F_rank[i]:
+                for q in p.S_p:
+                    q.n -= 1
+                    if (q.n == 0):
+                        q.rank = i + 1
+                        Q.append(q)
+
+            if(Q != []):
+                i += 1
+                self.F_rank.append(Q)
+            else:
+                break
+
+
+    def isDominated(self, fitness_1, fitness_2):  # 前者是否支配后者
+        flag = -1
+        for i in range(self.objectNumber):
+            if fitness_1[i] < fitness_2[i]:
+                flag = 0
+            if fitness_1[i] > fitness_2[i]:
+                return False
+        if flag == 0:
+            return True
+        else:
+            return False
+
+
+
+
+    def calculateFitness(self, ind):
+        ind.fitness = []
+        time = []
+        energy = []
+        for gene in ind.chromosome:
+            smd = gene  #一个gene就是一个SMD
+            self.calculateWorkflowTimeEnergy(smd, smd.workflow)
+            time.append(smd.workflow.schedule.T_total)
+            energy.append(smd.workflow.schedule.E_total)
+        ind.fitness.append(np.average(time))
+        ind.fitness.append(np.average(energy))
+
+    def calculateWorkflowTimeEnergy(self, smd, workflow):
+        workflow.schedule.TimeEnergy = []
+        workflow.schedule.T_total = None
+        workflow.schedule.E_total = 0
+
+        # 初始化所有执行单元的时间点
+        for node in self.MEC_nodes:
+            workflow.schedule.MECTP[node["id"]] = [0]
+        workflow.schedule.cloudTP = [0]  # 云中心时间点
+
+        for i in range(len(workflow.sequence)):
+            taskId = workflow.sequence[i]
+            pos = workflow.position[i]
+            task = workflow.taskSet[taskId]
+            task.exePosition = pos
+
+            if pos >= 4:  # MEC节点或云中心执行
+                task.islocal = False
+                mec_node = None
+                for node in self.MEC_nodes:
+                    if node["id"] == pos:
+                        mec_node = node
+                        break
+
+                if mec_node is None:
+                    continue
+
+                # 入口任务
+                if task.id == workflow.entryTask:
+                    task.RT_i_l = task.ST_i_l = task.FT_i_l = 0
+
+                    # 无线发送到边缘节点
+                    task.RT_i_ws = task.ST_i_ws = 0.0
+                    task.FT_i_ws = task.ST_i_ws + task.d_i_j_k / smd.R_i_j
+
+                    if mec_node["type"] == "cloud":
+                        # 云中心执行：额外增加有线传输时间
+                        task.RT_i_c = task.ST_i_c = task.FT_i_ws
+                        # 有线传输到云中心
+                        task.FT_i_c = task.ST_i_c + task.d_i_j_k / self.cloud_bandwidth
+                        # 云中心计算
+                        task.ST_i_cloud = task.FT_i_c
+                        task.FT_i_cloud = task.ST_i_cloud + task.c_i_j_k / mec_node["compute_capacity"]
+                        # 接收就绪时间（云中心执行无返回传输时间）
+                        task.RT_i_wr = task.ST_i_wr = task.FT_i_cloud
+                        task.FT_i_wr = task.ST_i_wr  # 无返回数据传输
+
+                        workflow.schedule.wsTP.append(task.FT_i_ws)
+                        workflow.schedule.MECTP[pos].append(task.FT_i_c)
+                        workflow.schedule.cloudTP.append(task.FT_i_cloud)
+                    else:
+                        # 边缘节点执行
+                        task.RT_i_c = task.ST_i_c = task.FT_i_ws = 0
+                        task.RT_i_ws = task.ST_i_ws = 0.0
+                        task.FT_i_ws = task.ST_i_ws + task.d_i_j_k / smd.R_i_j
+                        task.RT_i_c = task.ST_i_c = task.FT_i_ws
+                        task.FT_i_c = task.ST_i_c + task.c_i_j_k / mec_node["compute_capacity"]
+                        task.RT_i_wr = task.ST_i_wr = task.FT_i_c
+                        task.FT_i_wr = task.ST_i_wr + task.o_i_j_k / smd.R_i_j
+
+                        workflow.schedule.wsTP.append(task.FT_i_ws)
+                        workflow.schedule.MECTP[pos].append(task.FT_i_c)
+                        workflow.schedule.wrTP.append(task.FT_i_wr)
+                else:  # 非入口任务
+                    task.ST_i_l = float("inf")
+                    task.FT_i_l = float("inf")
+
+                    # 无线发送就绪时间
+                    task.RT_i_ws = self.get_RT_i_ws(task, workflow)
+                    if workflow.schedule.wsTP[-1] < task.RT_i_ws:
+                        task.ST_i_ws = task.RT_i_ws
+                    else:
+                        task.ST_i_ws = workflow.schedule.wsTP[-1]
+                    task.FT_i_ws = task.ST_i_ws + task.d_i_j_k / smd.R_i_j
+                    workflow.schedule.wsTP.append(task.FT_i_ws)
+
+                    if mec_node["type"] == "cloud":
+                        # 云中心执行
+                        task.RT_i_c = self.get_RT_i_c(task, workflow)
+                        if workflow.schedule.MECTP[pos][-1] < task.RT_i_c:
+                            task.ST_i_c = task.RT_i_c
+                        else:
+                            task.ST_i_c = workflow.schedule.MECTP[pos][-1]
+                        # 有线传输到云中心
+                        task.FT_i_c = task.ST_i_c + task.d_i_j_k / self.cloud_bandwidth
+                        workflow.schedule.MECTP[pos].append(task.FT_i_c)
+
+                        # 云中心计算
+                        task.RT_i_cloud = max(task.FT_i_c, self.get_RT_i_cloud(task, workflow))
+                        if workflow.schedule.cloudTP[-1] < task.RT_i_cloud:
+                            task.ST_i_cloud = task.RT_i_cloud
+                        else:
+                            task.ST_i_cloud = workflow.schedule.cloudTP[-1]
+                        task.FT_i_cloud = task.ST_i_cloud + task.c_i_j_k / mec_node["compute_capacity"]
+                        workflow.schedule.cloudTP.append(task.FT_i_cloud)
+
+                        # 接收就绪时间
+                        task.RT_i_wr = task.ST_i_wr = task.FT_i_cloud
+                        task.FT_i_wr = task.ST_i_wr  # 无返回传输
+                    else:
+                        # 边缘节点执行
+                        task.RT_i_c = self.get_RT_i_c(task, workflow)
+                        if workflow.schedule.MECTP[pos][-1] < task.RT_i_c:
+                            task.ST_i_c = task.RT_i_c
+                        else:
+                            task.ST_i_c = workflow.schedule.MECTP[pos][-1]
+                        task.FT_i_c = task.ST_i_c + task.c_i_j_k / mec_node["compute_capacity"]
+                        workflow.schedule.MECTP[pos].append(task.FT_i_c)
+
+                        task.RT_i_wr = task.FT_i_c
+                        if workflow.schedule.wrTP[-1] < task.RT_i_wr:
+                            task.ST_i_wr = task.RT_i_wr
+                        else:
+                            task.ST_i_wr = workflow.schedule.wrTP[-1]
+                        task.FT_i_wr = task.ST_i_wr + task.o_i_j_k / smd.R_i_j
+                        workflow.schedule.wrTP.append(task.FT_i_wr)
+
+                # 计算能耗（云中心执行能耗为0）
+                if mec_node["type"] != "cloud":
+                    task.energy += smd.pws_i_j * (task.FT_i_ws - task.ST_i_ws)
+                    task.energy += smd.pwr_i_j * (task.FT_i_wr - task.ST_i_wr)
+                    # 边缘节点执行能耗
+                    execution_time = task.FT_i_c - task.ST_i_c
+                    task.energy += mec_node["power_consumption"] * execution_time
+
+                workflow.schedule.E_total += task.energy
+            else:  # 本地执行
+                task.islocal = True
+                task.RT_i_ws = task.RT_i_c = task.RT_i_wr = 0.0
+                task.ST_i_ws = task.ST_i_c = task.ST_i_wr = 0.0
+                task.FT_i_ws = task.FT_i_c = task.FT_i_wr = 0.0
+
+                if task.id == workflow.entryTask:
+                    task.RT_i_l = task.ST_i_l = 0
+                    task.FT_i_l = task.ST_i_l + task.c_i_j_k / smd.coreCC[pos]
+                else:
+                    task.RT_i_l = self.get_RT_i_l(task, workflow)
+                    if task.RT_i_l > workflow.schedule.coreTP[pos][-1]:
+                        task.ST_i_l = task.RT_i_l
+                    else:
+                        task.ST_i_l = workflow.schedule.coreTP[pos][-1]
+                    task.FT_i_l = task.ST_i_l + task.c_i_j_k / smd.coreCC[pos]
+
+                workflow.schedule.coreTP[pos].append(task.FT_i_l)
+                task.energy = smd.pcc_i_j[pos] * (task.FT_i_l - task.ST_i_l)
+                workflow.schedule.E_total += task.energy
+
+            workflow.schedule.S[pos].append(task.id)
+
+        # 计算工作流总时间
+        exit_task = workflow.taskSet[workflow.exitTask]
+        if exit_task.islocal:
+            workflow.schedule.T_total = exit_task.FT_i_l
+        elif exit_task.exePosition == 7:  # 云中心执行
+            workflow.schedule.T_total = exit_task.FT_i_cloud
+        else:  # 边缘节点执行
+            workflow.schedule.T_total = exit_task.FT_i_wr
+
+        workflow.schedule.TimeEnergy.append(workflow.schedule.T_total)
+        workflow.schedule.TimeEnergy.append(workflow.schedule.E_total)
+
+    def get_RT_i_ws(self, task, workflow):
+        if task.id == workflow.entryTask:
+            return 0.0
+        else:
+            pre_max = []
+            for pre_taskId in task.preTaskSet:
+                if workflow.taskSet[pre_taskId].islocal == True:
+                    pre_max.append(workflow.taskSet[pre_taskId].FT_i_l)
+                else:
+                    pre_max.append(workflow.taskSet[pre_taskId].FT_i_ws)
+            return max(pre_max)
+
+    def get_RT_i_c(self, task, workflow):
+        pre_max = []
+        for pre_taskId in task.preTaskSet:
+            pre_max.append(workflow.taskSet[pre_taskId].FT_i_c)
+        return max(task.FT_i_ws, max(pre_max))
+
+    def get_RT_i_l(self, task, workflow):
+        if task.id == workflow.entryTask:
+            return 0.0
+        else:
+            pre_max = []
+            for pre_taskId in task.preTaskSet:
+                if workflow.taskSet[pre_taskId].islocal == True:
+                    pre_max.append(workflow.taskSet[pre_taskId].FT_i_l)
+                else:
+                    pre_max.append(workflow.taskSet[pre_taskId].FT_i_wr)
+            return max(pre_max)
+
+    def get_RT_i_cloud(self, task, workflow):
+        """获取云中心执行的就绪时间"""
+        pre_max = []
+        for pre_taskId in task.preTaskSet:
+            pre_task = workflow.taskSet[pre_taskId]
+            if pre_task.exePosition == 7:  # 前驱任务在云中心执行
+                pre_max.append(pre_task.FT_i_cloud)
+            else:
+                pre_max.append(pre_task.FT_i_c)
+        return max(pre_max) if pre_max else 0
+
+
+    def reInitialize_WorkflowTaskSet_Schedule(self, smd):
+        for task in smd.workflow.taskSet:
+            self.reInitializeTaskSet(task)
+        self.reInitializeSchedule(smd.workflow.schedule)
+
+
+    def reInitializeTaskSet(self, task):
+        task.islocal = None
+        task.exePosition = None
+        task.RT_i_l = task.ST_i_l = task.FT_i_l = None
+        task.RT_i_ws = task.RT_i_c = task.RT_i_wr = None
+        task.ST_i_ws = task.ST_i_c = task.ST_i_wr = None
+        task.FT_i_ws = task.FT_i_c = task.FT_i_wr = None
+        task.energy = 0
+
+
+    def reInitializeSchedule(self, schedule):
+        schedule.S = {1: [], 2: [], 3: [], 4: [], 5: [], 6: [], 7: []}  # 1-3: 本地核心, 4-6: 边缘节点, 7: 云中心
+        schedule.coreTP = {1:[0], 2:[0], 3:[0]}
+        schedule.wsTP = [0]
+        schedule.MECTP = {}
+        for node in self.MEC_nodes:
+            schedule.MECTP[node["id"]] = [0]
+        schedule.cloudTP = [0]  # 云中心时间点
+        schedule.wrTP = [0]
+        schedule.T_total = None
+        schedule.E_total = 0
+        schedule.TimeEnergy = []
+
+
+    def initializeWorkflowSequence(self, workflow):
+        S = []  # 待排序的任务集合
+        R = []  # 已排序任务
+        T = []
+        R.append(workflow.entryTask)
+        for task in workflow.taskSet:
+            T.append(task.id)
+        T.remove(workflow.entryTask)
+
+        while T != []:
+            for t in T:
+                if set(workflow.taskSet[t].preTaskSet).issubset(set(R)):  #判断t的前驱节点集是否包含在R中
+                    if t not in S:
+                        S.append(t)
+            ti = random.choice(S) #随机从S中选择一个元素
+            S.remove(ti)
+            T.remove(ti)
+            R.append(ti)
+        return R
+
+
+
+
+    def calculateInterference(self):
+        for i in range(self.M):
+            for j in range(self.SeNBSet[i].SMDNumber):
+               I_i_j = 0
+               for m in range(self.M):
+                   if(self.SeNBSet[m] != self.SeNBSet[i]):
+                       for k in range(self.SeNBSet[m].SMDNumber):
+                           if(self.SeNBSet[m].SMDSet[k].channel == self.SeNBSet[i].SMDSet[j].channel):  # U_m_j and U_l_i have the same channel
+                               g_i_m_k = self.getChannelGain(self.SeNBSet[m].SMDSet[k].coordinate, self.SeNBSet[i].coordinate)
+                               I_i_j += self.SeNBSet[m].SMDSet[k].pws_i_j * g_i_m_k
+               self.SeNBSet[i].SMDSet[j].I_i_j = I_i_j
+
+
+    def calculateDataTransmissionRate(self):
+        self.calculateChannelGain()
+        for i in range(self.M):
+            for j in range(self.SeNBSet[i].SMDNumber):
+                log_v = 1 + (self.SeNBSet[i].SMDSet[j].pws_i_j*self.SeNBSet[i].SMDSet[j].g_i_j) / (self.noisePower + self.SeNBSet[i].SMDSet[j].I_i_j)
+                self.SeNBSet[i].SMDSet[j].R_i_j = self.w * math.log(log_v, 2)
+
+
+    def calculateChannelGain(self):  #calculate G_m_j between SMD U_m_j and SeNB S_m
+        for i in range(self.M):
+            for j in range(self.SeNBSet[i].SMDNumber):
+                self.SeNBSet[i].SMDSet[j].g_i_j = self.getChannelGain(self.SeNBSet[i].SMDSet[j].coordinate, self.SeNBSet[i].coordinate)
+
+
+    def getChannelGain(self, U_i_j, S_i):  # channel gain= D^(-pl), where D is the distance between U_m_j and S_m, pl=4 is the path loss factor
+        distance = self.getDistance(U_i_j, S_i)
+        channelGain = pow(distance, -4)
+        return channelGain
+
+
+    def getDistance(self, point1, point2):
+        return np.sqrt(np.sum(np.square([point1[i] - point2[i] for i in range(2)])))
+
+
+    def getWorkflow(self, filename):
+        wf = Workflow()
+        with open(filename, 'r') as readFile:
+            for line in readFile:
+                task = Task()
+                s = line.splitlines()
+                s = s[0].split(':')
+                predecessor = s[0]
+                id = s[1]
+                successor = s[2]
+                if (predecessor != ''):
+                    predecessor = predecessor.split(',')
+                    for pt in predecessor:
+                        task.preTaskSet.append(int(pt))
+                else:
+                    wf.entryTask = int(id)
+                task.id = int(id)
+                if (successor != ''):
+                    successor = successor.split(',')
+                    for st in successor:
+                        task.sucTaskSet.append(int(st))
+                else:
+                    wf.exitTask = int(id)
+                wf.taskSet.append(task)
+        return wf
+
+
+    def readMECNetwork(self):
+        file_SMD_task_cpu = open(self.getCurrentPath() + '\\' + self.taskNumberRange + '\SMD_Task_CPU_Cycles_Number.txt', 'r')
+        file_SMD_task_data = open(self.getCurrentPath() + '\\' + self.taskNumberRange + '\SMD_Task_Data_Size.txt', 'r')
+        file_SMD_output_task_data = open(self.getCurrentPath() + '\\' + self.taskNumberRange + '\SMD_Task_Output_Data_Size.txt', 'r')
+
+        SeNB_count = -1
+        with open(self.getCurrentPath() + '\\' + self.taskNumberRange + '\MEC_Network.txt', 'r') as readFile:
+            for line in readFile:
+                if(line == '---file end---\n'):
+                    break
+                elif(line == 'SeNB:\n'):
+                    SeNB_count += 1
+                    senb = SeNB()     #create SeNB cell
+                    if(readFile.readline() == 'Coordinate:\n'):
+                        SeNB_crd = readFile.readline()
+                        SeNB_crd = SeNB_crd.splitlines()
+                        SeNB_crd = SeNB_crd[0].split('  ')
+                        senb.coordinate.append(float(SeNB_crd[0]))
+                        senb.coordinate.append(float(SeNB_crd[1]))
+
+                        if(readFile.readline() == 'SMD number:\n'):
+                            senb.SMDNumber = int(readFile.readline())
+
+                        for line1 in readFile:
+                            if (line1 == '---SeNB end---\n'):
+                                break
+                            elif(line1 == 'SMD:\n'):
+                                self.totalSMDNumber += 1
+                                smd = SMD()
+                                if (readFile.readline() == 'Coordinate:\n'):
+                                    SMD_crd = readFile.readline()
+                                    SMD_crd = SMD_crd.splitlines()
+                                    SMD_crd = SMD_crd[0].split('  ')
+                                    smd.coordinate.append(float(SMD_crd[0]))
+                                    smd.coordinate.append(float(SMD_crd[1]))
+
+                                if (readFile.readline() == 'Computation capacity:\n'):
+                                    SMD_cc = readFile.readline()
+                                    SMD_cc = SMD_cc.splitlines()
+                                    SMD_cc = SMD_cc[0].split('  ')
+                                    smd.coreCC[1] = float(SMD_cc[0])
+                                    smd.coreCC[2] = float(SMD_cc[1])
+                                    smd.coreCC[3] = float(SMD_cc[2])
+
+                                if (readFile.readline() == 'The number of task:\n'):  #在SeNB（SeNB_count）下得到一个工作流
+                                    taskNumber = int(readFile.readline())
+                                    SeNB_directory = "SeNB-"+str(SeNB_count)+"\\t"+str(taskNumber)+".txt"
+                                    wf_directory = self.getCurrentPath()+"\workflowSet\\"+SeNB_directory
+                                    smd.workflow = self.getWorkflow(wf_directory)
+                                    smd.workflow.taskNumber = taskNumber
+                                    self.codeLength += taskNumber
+                                    for task in smd.workflow.taskSet:
+                                        task.c_i_j_k = float(file_SMD_task_cpu.readline())    #读取执行任务需要的cpu循环数量
+                                        task.d_i_j_k = float(file_SMD_task_data.readline()) * 1024
+                                        task.o_i_j_k = float(file_SMD_output_task_data.readline()) * 1024
+
+                                if (readFile.readline() == 'Channel:\n'):
+                                    channel = readFile.readline()
+                                    smd.channel = int(channel)
+
+                                senb.SMDSet.append(smd)
+                    self.SeNBSet.append(senb)
+        file_SMD_task_data.close()
+        file_SMD_task_cpu.close()
+
+
+
+    def getCurrentPath(self):
+        return os.path.dirname(os.path.realpath(__file__))
+
+
+
+
+
+class Individual:
+    def __init__(self):
+        self.chromosome = []      #基因位是SMD类型
+        self.fitness = []
+        self.isFeasible = True    #判断该个体是否合法
+        self.temp_fitness = None  #临时适应度，计算拥挤距离的时候，按每个目标值来对类列表进行升序排序
+        self.distance = 0.0
+        self.rank = None
+        self.S_p = []  #种群中此个体支配的个体集合
+        self.n = 0  #种群中支配此个体的个数
+
+class SeNB:
+    def __init__(self):
+        self.coordinate = []  # SeNB的位置坐标
+        self.SMDNumber = 0    # SMD设备数量
+        self.SMDSet = []      # 该SeNB覆盖的SMD设备集合
+
+class SMD:
+    def __init__(self):
+        self.coordinate = []          # SMD设备的位置坐标
+        self.workflow = Workflow()    # SMD设备的工作流
+        self.channel = None           # 获取的信道索引
+        self.g_i_j = None             # SMD与SeNB之间的信道增益
+        self.R_i_j = None             # SMD的数据传输速率
+        self.I_i_j = None             # SMD受到的干扰
+        # SMD被建模为一个4元组
+        self.coreCC = {1:None, 2:None, 3:None}  # 核心的计算能力
+
+        self.pcc_i_j = {1:4, 2:2, 3:1}  # 三个核心在最大工作频率下的功耗
+        self.pws_i_j = 0.5  # SMD的发送数据功率（瓦）
+        self.pwr_i_j = 0.1  # SMD的接收数据功率（瓦）
+
+class Workflow:
+    def __init__(self):
+        self.entryTask = None      # 开始任务
+        self.exitTask = None       # 结束任务
+        self.position = []         # 执行位置
+        self.sequence = []         # 执行顺序
+        self.taskNumber = None     # 任务数量
+        self.taskSet = []          # 任务集合（列表索引值就是任务的id值）
+        self.schedule = Schedule() # 调度信息
+
+class Schedule:
+    def __init__(self):
+        self.taskSet = {}          # 任务集合
+        self.S = {1: [], 2: [], 3: [], 4: [], 5: [], 6: [], 7: []}  # 执行单元：1-3本地核心，4-6边缘节点，7云中心
+        self.coreTP = {1:[0], 2:[0], 3:[0]}  # 键为核心编号，元素表示该核心上的当前时间点
+        self.wsTP = [0]  # 无线发送信道上的当前时间点
+
+        self.MECTP = {}  # MEC节点时间点，将在运行时初始化
+        self.cloudTP = [0]  # 云中心时间点
+
+        self.wrTP = [0]  # 无线接收信道上的当前时间点
+        self.T_total = None  # 总时间
+        self.E_total = 0     # 总能耗
+        self.TimeEnergy = [] # 时间能耗记录
+
+class Task:
+    def __init__(self):
+        self.id = None             # 任务ID
+        self.islocal = None        # 表示任务是在本地执行还是在云端执行
+        self.preTaskSet = []       # 前驱任务集合（元素为Task类）
+        self.sucTaskSet = []       # 后继任务集合（元素为Task类）
+        self.exePosition = None    # 任务的执行位置（即[1,2,3,4]）
+        self.actualFre = 1         # 实际频率缩放因子
+        self.c_i_j_k = None        # 执行任务所需的CPU周期数
+        self.d_i_j_k = None        # 任务的数据大小
+        self.o_i_j_k = None        # 任务的输出数据大小
+
+        self.RT_i_l = None         # 任务vi在本地核心上的就绪时间
+        self.RT_i_ws = None        # 任务vi在无线发送信道上的就绪时间
+        self.RT_i_c = None         # 任务vi在[10,20]服务器上的就绪时间
+        self.RT_i_wr = None        # 云端传输回任务vi结果的就绪时间
+        self.RT_i_cloud = None  # 云中心就绪时间
+
+        self.ST_i_l = None         # 任务vi在本地核心上的开始时间
+        self.ST_i_ws = None        # 任务vi在无线发送信道上的开始时间
+        self.ST_i_c = None         # 任务vi在[10,20]服务器上的开始时间
+        self.ST_i_wr = None        # 云端传输回任务vi结果的开始时间
+        self.ST_i_cloud = None  # 云中心开始时间
+
+        self.FT_i_l = None         # 任务vj在本地核心上的完成时间
+        self.FT_i_ws = None        # 任务vj在无线发送信道上的完成时间
+        self.FT_i_c = None         # 任务vj在[10,20]服务器上的完成时间
+        self.FT_i_wr = None        # 任务vj在无线接收信道上的完成时间
+        self.energy = 0            # 能耗
+        self.FT_i_cloud = None  # 云中心完成时间
+
+class Pareto:
+    def __init__(self):
+        self.chromosome = None
+        self.fitness = []
+        self.temp_fitness = None  #排序使用
